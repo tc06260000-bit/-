@@ -1,0 +1,6 @@
+interface:
+  display_name: "ChatGPT 分享原文核对"
+  short_description: "自动提取分享对话，逐段核对原文并引用回答；失败时停答"
+  default_prompt: "使用 $chatgpt-share-grounded 读取这个 ChatGPT 分享链接，核对实际读取范围后根据原文回答。"
+policy:
+  allow_implicit_invocation: true
