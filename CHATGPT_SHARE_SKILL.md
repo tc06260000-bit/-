@@ -1,3 +1,5 @@
+> **普通 ChatGPT 网页聊天请使用 [Chrome / Edge 浏览器版](CHATGPT_BROWSER.md)。** 本页的 Skills ZIP 和 Codex 命令只适用于具备相应技能入口的客户端，不能直接装进普通聊天。
+
 # ChatGPT 分享原文核对：下载与安装
 
 [下载技能安装包（ZIP）](https://github.com/tc06260000-bit/-/raw/refs/heads/main/dist/chatgpt-share-grounded.zip)

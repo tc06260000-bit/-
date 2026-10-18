@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT 分享原文核对（普通聊天）",
+  "version": "1.0.0",
+  "description": "在普通 ChatGPT 网页发送分享链接前读取原文，核对通过后自动补入消息；失败则阻止本次发送。",
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["core.js", "content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}
