@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>分享回复核对</title>
+  <style>
+    body{width:350px;margin:0;padding:18px;box-sizing:border-box;font:14px/1.6 system-ui,sans-serif;color:#172033;background:#f8fafc}h1{font-size:17px;margin:0 0 10px}p{margin:8px 0}button{font:inherit;cursor:pointer;border:0;border-radius:7px;padding:8px 12px;background:#1d4ed8;color:white}button:disabled{opacity:.55;cursor:wait}#status{color:#475569}#findings{padding-left:20px}#findings li{margin:7px 0;overflow-wrap:anywhere}.small{font-size:12px;color:#64748b}textarea{box-sizing:border-box;width:100%;height:110px;margin:7px 0;padding:8px;resize:vertical;font:12px/1.5 system-ui}#copy{background:#e2e8f0;color:#172033}#followup{display:none}
+  </style>
+</head>
+<body>
+  <h1>分享回复核对 <span class="small">v1.1.0</span></h1>
+  <p id="status" role="status" aria-live="polite">正在连接当前 ChatGPT 标签页…</p>
+  <button id="audit" type="button" disabled>检查最近一次链接回复</button>
+  <p id="summary"></p>
+  <ul id="findings"></ul>
+  <div id="followup">
+    <label for="prompt">需要时可复制这段追问，由你决定是否发送：</label>
+    <textarea id="prompt" readonly>请重新核对上一条回复。仅依据实际读取的分享原文，列出消息编号和对应原句；找不到的依据请明确撤回。若没有读到原文，请直接说明，不要声称已经读过。</textarea>
+    <button id="copy" type="button">复制追问</button>
+  </div>
+  <p class="small">只核对可比对的编号、原句和消息条数。未发现不一致不代表没有幻觉；不会自动发送纠错消息。</p>
+  <script src="popup.js"></script>
+</body>
+</html>

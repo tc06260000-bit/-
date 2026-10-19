@@ -1,33 +1,42 @@
-# 普通 ChatGPT 聊天：浏览器版安装
+# 普通 ChatGPT 聊天：浏览器版 1.1.0
 
-这版用于你电脑上的 Chrome / Edge 普通 ChatGPT 网页聊天。安装位置是**浏览器扩展管理页**。
+用于电脑 Chrome / Edge 的普通 ChatGPT 网页聊天。安装在**使用分享链接的账号所在浏览器**。
 
-**[下载普通聊天浏览器版 ZIP](https://github.com/tc06260000-bit/-/raw/refs/heads/main/dist/chatgpt-share-browser.zip)**
+**[下载新版 ZIP（v1.1.0）](https://github.com/tc06260000-bit/-/raw/refs/heads/main/dist/chatgpt-share-browser-v1.1.0.zip)**
 
-## 安装
+## 从旧版升级
 
-1. 下载 ZIP，并在电脑上解压。
-2. Chrome 地址栏输入 `chrome://extensions`；Edge 输入 `edge://extensions`。
-3. 打开该页面的「开发者模式」。
-4. 点击「加载已解压的扩展程序」，选择解压后**直接包含 manifest.json** 的 `chatgpt-share-browser` 文件夹。
-5. 刷新 ChatGPT 网页。看到左下角「分享原文核对：已就绪」后使用。
+1. 在 `chrome://extensions` 或 `edge://extensions` **移除旧版扩展**。
+2. 下载并解压新版 ZIP，打开扩展管理页的「开发者模式」。
+3. 点击「加载已解压的扩展程序」，选择直接包含 `manifest.json` 的 `chatgpt-share-browser` 文件夹。
+4. **刷新所有已经打开的 ChatGPT 标签页**，清除旧脚本和常驻提示。
+5. 点浏览器工具栏的扩展图标，确认面板显示 **v1.1.0**。扩展与备用油猴脚本只启用一种。
 
-不需要 Python、Skills、Codex、API 密钥或 ChatGPT 的开发者模式。这个 ZIP 不需要上传到聊天。
+首次安装可直接从第 2 步开始。不需要 Python、Skills、Codex、API 密钥或 ChatGPT 的开发者模式；ZIP 不需要上传到聊天。
 
-## 用法
+## 这次修复和新增
 
-在接收分享链接的账号，打开普通 ChatGPT 网页聊天，粘贴一个完整的 `https://chatgpt.com/share/…` 链接，照常按 Enter 或点击发送。也可以在链接后加问题。
+- 空闲聊天、没有输入框的分享阅读页不再常驻「未保护」提示。活动提示可关闭，并会自动隐藏。
+- 普通聊天发送一个分享链接时，先读取并核对支持的完整文本，再将原文、消息编号与问题填入输入框，触发一次发送；失败或超限时停止，不截断原文。
+- 回复稳定后，检查不存在的消息编号、与对应消息不符的明确引文、错误消息条数，以及声称读过但缺少可匹配原句的情况。
+- 切换聊天清除上一聊天的来源、核对结果和原文下载，避免混用。
 
-扩展会先读取分享页、核对支持的可见文本，再把原文、消息条数和引用编号一起填入输入框，并触发一次发送。读取失败时会说明原因，不自动发送裸链接。若显示「未保护」，不要依赖本扩展。
+## 怎样用
 
-## 核验情况
+在接收链接的账号打开普通 ChatGPT 聊天，粘贴一个完整的 `https://chatgpt.com/share/…` 链接，可附上问题，再照常发送。
 
-43 项解析测试和 25 项真实 Chromium 中的合成页面行为测试通过。本次云端 Chromium 禁止加载本地扩展，真实分享页也受到网络策略限制，因此**尚未完成用户真实 ChatGPT 页面中的扩展安装和端到端验证**。这不是保证模型零幻觉的工具。
+检查已经发生的回复：点扩展图标 → **检查最近一次链接回复**，或按 **Alt+Shift+L**。在分享阅读页，会尝试定位其中最近一次用户发送的分享链接及其对应回复，再读取那个来源进行核对。没有这种消息配对、来源无法读取或多个链接无法确定时，会说明不能核验。
 
-扩展只访问 ChatGPT 同源分享页，请求可能使用你当前的 ChatGPT 登录会话；不读取 Cookie 值，不向第三方上传资料。超过 60000 字符的完整提示词或含无法读取的附件时会停止，不截断。网站改版或未知发送入口可能超出拦截范围。
+核对有疑点时提醒；不会自动给 GPT 增发纠错消息。面板可复制追问，由你决定是否发送。
 
-[完整说明与范围](browser-extension/chatgpt-share-browser/README.md) · [测试与限制](browser-extension/chatgpt-share-browser/VALIDATION.md) · [扩展源码](browser-extension/chatgpt-share-browser/)
+## 核验和限制
 
-备用油猴脚本：[查看完整源码](dist/chatgpt-share-guard.user.js)。扩展版与油猴版只启用一个。
+这是原文提供和证据核对工具，**不能保证识别所有编造**。编号、明确条数和逐字引用可以机械核对；语义推理、概括及没有引用的事实可能无法判断。证据不足不等于已证明造假，正确引用也不等于整篇回答真实。
 
-支持 Skills 的其他客户端仍可使用 [原 Skills 版](CHATGPT_SHARE_SKILL.md)。
+91 项 JavaScript 测试及 41 项浏览器合成页面流程测试通过，详见下方验证记录。云端浏览器的管理员策略禁止加载本地扩展，网络策略也限制 ChatGPT 请求，因此尚未在用户真实页面完成扩展安装和端到端验证。
+
+只对 ChatGPT 同源分享页请求，可能正常使用当前登录会话；不读取 Cookie 值，不上传到第三方。超过 60000 字符单位的完整提示词、附件或未知结构会停止。网站改版、未知发送入口和模型上下文容量仍可能影响使用。
+
+[完整说明](browser-extension/chatgpt-share-browser/README.md) · [测试与限制](browser-extension/chatgpt-share-browser/VALIDATION.md) · [扩展源码](browser-extension/chatgpt-share-browser/)
+
+备用油猴脚本：[查看完整源码](dist/chatgpt-share-guard.user.js)。支持 Skills 的客户端仍可使用 [原 Skills 版](CHATGPT_SHARE_SKILL.md)。

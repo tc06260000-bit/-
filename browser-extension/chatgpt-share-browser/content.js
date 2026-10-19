@@ -13,27 +13,40 @@
     '[data-testid="prompt-textarea"]',
     'form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]',
     'form[data-type="unified-composer"] [contenteditable="true"][role="textbox"]',
-    '[data-lexical-editor="true"][contenteditable="true"][role="textbox"]'
+    '[data-lexical-editor="true"][contenteditable="true"][role="textbox"]',
+    '[data-composer-markdown][contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"]',
+    '[contenteditable="plaintext-only"][role="textbox"]',
+    'textarea[aria-label="Message ChatGPT"]',
+    'textarea[aria-label="与 ChatGPT 聊天"]',
+    'textarea[placeholder="有问题，尽管问"]'
   ].join(",");
   const SEND_LABELS = new Set(["发送", "发送消息", "发送提示", "send", "send message", "send prompt"]);
   const state = {
     phase: "idle", revision: 0, writing: false, transaction: null,
     replayWindow: null, prepared: null, lastExport: null, notice: "",
-    protected: false, counter: 0
+    protected: false, counter: 0, noticeUntil: 0, noticeToken: 0, lastAudit: null
   };
   let statusElement;
   let statusText;
   let downloadButton;
+  let noticeTimer;
+  let audit = null;
   let refreshing = false;
 
   function visible(element) {
-    return Boolean(element && element.isConnected && element.getClientRects().length &&
+    return Boolean(element && element.isConnected && !element.closest('[hidden], [inert], [aria-hidden="true"]') && element.getClientRects().length &&
       getComputedStyle(element).visibility !== "hidden" && getComputedStyle(element).display !== "none");
   }
 
+  function editorCandidate(element) {
+    return visible(element) && (element instanceof HTMLTextAreaElement || element.isContentEditable) &&
+      !element.disabled && !element.readOnly &&
+      !element.closest('[data-message-author-role], [data-user-message-bubble], [data-chatgpt-selection-message-id], [data-testid^="conversation-turn"], [data-chatgpt-search-unit-key]');
+  }
+
   function composer() {
-    const matches = [...document.querySelectorAll(EDITOR_SELECTOR)].filter(element =>
-      visible(element) && (element instanceof HTMLTextAreaElement || element.isContentEditable));
+    const matches = [...document.querySelectorAll(EDITOR_SELECTOR)].filter(editorCandidate);
     return matches.length === 1 ? matches[0] : null;
   }
 
@@ -47,7 +60,17 @@
   }
 
   function scopeOf(editor) {
-    return editor?.closest('form, [data-chatgpt-composer], [data-type="unified-composer"]') || null;
+    if (!editor) return null;
+    const known = editor.closest('form, [data-chatgpt-composer], [data-type="unified-composer"], [data-testid="composer"]');
+    if (known && known !== editor) return known;
+    let parent = editor.parentElement;
+    for (let level = 0; parent && level < 8 && parent !== document.body; level++, parent = parent.parentElement) {
+      const buttons = [...parent.querySelectorAll("button")].filter(button => visible(button) && isSendButton(button));
+      if (!buttons.length) continue;
+      const editors = [...parent.querySelectorAll(EDITOR_SELECTOR)].filter(editorCandidate);
+      return buttons.length === 1 && editors.length === 1 && editors[0] === editor ? parent : null;
+    }
+    return null;
   }
 
   function isSendButton(button) {
@@ -82,7 +105,8 @@
     statusElement.id = "share-link-guard-status";
     statusElement.setAttribute("role", "status");
     statusElement.setAttribute("aria-live", "polite");
-    statusElement.style.cssText = "position:fixed;left:12px;bottom:12px;max-width:min(500px,85vw);z-index:2147483647;padding:9px 12px;border:1px solid #64748b;border-radius:10px;background:#0f172a;color:#f8fafc;font:12px/1.5 system-ui,sans-serif;box-shadow:0 2px 12px #0003;white-space:normal;";
+    statusElement.hidden = true;
+    statusElement.style.cssText = "display:none;position:fixed;right:16px;top:72px;max-width:min(440px,85vw);z-index:2147483647;padding:12px 38px 12px 14px;border:1px solid #64748b;border-radius:10px;background:#0f172a;color:#f8fafc;font:13px/1.6 system-ui,sans-serif;box-shadow:0 2px 12px #0003;white-space:normal;";
     statusText = document.createElement("span");
     downloadButton = document.createElement("button");
     downloadButton.type = "button";
@@ -90,6 +114,7 @@
     downloadButton.hidden = true;
     downloadButton.style.cssText = "display:block;margin-top:5px;border:1px solid #94a3b8;border-radius:5px;padding:3px 7px;background:#1e293b;color:#f8fafc;cursor:pointer;";
     downloadButton.addEventListener("click", () => {
+      checkPage();
       if (!state.lastExport) return;
       const blob = new Blob([state.lastExport], { type: "text/plain;charset=utf-8" });
       const url = URL.createObjectURL(blob);
@@ -101,7 +126,13 @@
       anchor.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
-    statusElement.append(statusText, downloadButton);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "×";
+    close.setAttribute("aria-label", "关闭提示");
+    close.style.cssText = "position:absolute;top:5px;right:7px;border:0;background:transparent;color:inherit;cursor:pointer;font:20px system-ui;";
+    close.addEventListener("click", dismissNotice);
+    statusElement.append(statusText, downloadButton, close);
     document.body.appendChild(statusElement);
   }
 
@@ -112,11 +143,14 @@
       mountStatus();
       const editor = composer();
       state.protected = Boolean(editor && sendButton(editor));
-      const readiness = state.protected ? "分享原文核对：已就绪（仅文字分享链接）" :
-        "分享原文核对：未保护，未识别输入框或发送按钮";
-      const message = state.protected ? (state.notice || readiness) :
-        readiness + (state.notice ? "。最近状态：" + state.notice : "");
-      if (statusText && statusText.textContent !== message) statusText.textContent = message;
+      // Missing a composer is normal on a share/read-only page. Readiness is
+      // available in the toolbar popup; idle pages never get a permanent toast.
+      const show = Boolean(state.notice && (state.noticeUntil === Infinity || Date.now() < state.noticeUntil));
+      if (statusText && statusText.textContent !== state.notice) statusText.textContent = state.notice;
+      if (statusElement) {
+        statusElement.hidden = !show;
+        statusElement.style.display = show ? "block" : "none";
+      }
       if (downloadButton) {
         downloadButton.hidden = !state.lastExport;
         downloadButton.style.display = state.lastExport ? "block" : "none";
@@ -124,8 +158,26 @@
     } finally { refreshing = false; }
   }
 
-  function notice(message) {
+  function dismissNotice() {
+    clearTimeout(noticeTimer);
+    state.notice = "";
+    state.noticeUntil = 0;
+    state.noticeToken++;
+    refreshStatus();
+  }
+
+  function notice(message, options = {}) {
+    clearTimeout(noticeTimer);
     state.notice = message;
+    const duration = options.persistent ? Infinity : (options.duration ?? 8000);
+    state.noticeUntil = duration === Infinity ? Infinity : Date.now() + duration;
+    const token = ++state.noticeToken;
+    if (duration !== Infinity) noticeTimer = setTimeout(() => {
+      if (state.noticeToken !== token) return;
+      state.notice = "";
+      state.noticeUntil = 0;
+      refreshStatus();
+    }, duration);
     refreshStatus();
   }
 
@@ -197,6 +249,16 @@
     return Core.parseShareHtml(await readResponse(response, transaction.controller), { url });
   }
 
+  async function fetchForAudit(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try { return await getShare(Core.normalizeShareUrl(url), { controller }); }
+    catch (error) {
+      throw new Error(String(error?.message || error).replace(/[，,]?\s*未发送[。.]?/g, ""));
+    }
+    finally { clearTimeout(timer); }
+  }
+
   function writeComposer(editor, text) {
     editor.focus();
     if (editor instanceof HTMLTextAreaElement) {
@@ -231,6 +293,10 @@
     if (!button) throw new Error("原文已填入，但发送按钮未就绪；未自动发送，也不会自动重试。");
     state.prepared = { text: prompt, editor: transaction.editor, href: location.href };
     state.phase = "replaying";
+    if (audit && transaction.share) {
+      audit.setContext(transaction.share, { requestText: prompt });
+      state.lastAudit = null;
+    }
     state.replayWindow = { button, editor: transaction.editor, text: prompt, href: location.href };
     notice(`已核对本次分享的 ${messageCount} 条文字，正在提交原文。`);
     try {
@@ -257,6 +323,7 @@
       clearTimeout(timeout);
       if (invalidated(transaction)) return;
       const prompt = Core.buildGroundedPrompt(share, { question, maxChars: MAX_PROMPT_CHARS });
+      transaction.share = share;
       state.lastExport = prompt;
       if (invalidated(transaction)) return;
       state.phase = "preparing";
@@ -317,7 +384,7 @@
     state.phase = "loading";
     state.prepared = null;
     state.lastExport = null;
-    notice("正在读取并核对分享原文；完成前不会发送链接。");
+    notice("正在读取并核对分享原文；完成前不会发送链接。", { persistent: true });
     // Keep the user's actual request separate from the source conversation.
     const question = text.replace(links[0].raw, "").trim();
     void run(transaction, links[0].url, question);
@@ -357,6 +424,10 @@
       observedHref = location.href;
       if (state.transaction) cancel();
       state.prepared = null;
+      state.lastExport = null;
+      state.lastAudit = null;
+      state.phase = "idle";
+      if (!state.transaction) dismissNotice();
     }
     if (state.transaction && !state.writing) {
       if (!state.transaction.editor.isConnected || composer() !== state.transaction.editor ||
@@ -368,10 +439,68 @@
   observer.observe(document, { childList: true, subtree: true });
   setInterval(checkPage, 250);
   document.addEventListener("DOMContentLoaded", refreshStatus, { once: true });
+  function handleAuditResult(report) {
+    if (!report) return;
+    state.lastAudit = report;
+    const needsAttention = ["issues", "review", "unverified"].includes(report.status);
+    if (needsAttention || report.manual) {
+      const summary = report.summary || (report.status === "no_mechanical_issue" ?
+        "当前可核对项未发现不一致；这不能证明回答没有幻觉。" : "本次信息不足，尚不能核实这条回复。");
+      notice("回复核对：" + summary, { duration: needsAttention ? 12000 : 8000 });
+    }
+  }
+  if (globalThis.ShareLinkGuardAudit?.create) {
+    audit = globalThis.ShareLinkGuardAudit.create({ fetchShare: fetchForAudit, onResult: handleAuditResult });
+    audit.start();
+  }
+  async function auditCurrentPage() {
+    checkPage();
+    if (!audit) {
+      const report = { status: "unverified", manual: true, findings: [], summary: "回复核对模块尚未加载，请更新扩展并刷新网页。" };
+      handleAuditResult(report);
+      return report;
+    }
+    notice("正在核对当前对话最近一次分享链接的回复…", { persistent: true });
+    const token = state.noticeToken;
+    try {
+      const report = await audit.auditCurrentPage({ manual: true });
+      if (!report && state.noticeToken === token) dismissNotice();
+      return report;
+    } catch (error) {
+      const report = { status: "unverified", manual: true, findings: [], summary: "暂时无法核对：" + String(error?.message || error) };
+      if (state.noticeToken === token) handleAuditResult(report);
+      return report;
+    }
+  }
+  function getState() {
+    checkPage();
+    const auditState = audit?.getState() || null;
+    return { phase: state.phase, protected: state.protected, notice: state.notice,
+      noticeVisible: Boolean(state.notice && (state.noticeUntil === Infinity || Date.now() < state.noticeUntil)),
+      pageType: /^\/share\//.test(location.pathname) ? "share" : "chat",
+      transactionCount: state.counter, activeTransaction: state.transaction?.id || null,
+      audit: auditState, lastAudit: state.lastAudit || auditState?.report || null };
+  }
+  document.addEventListener("keydown", event => {
+    if (event.altKey && event.shiftKey && event.code === "KeyL") {
+      event.preventDefault();
+      void auditCurrentPage();
+    }
+  }, true);
+  if (typeof chrome !== "undefined" && chrome.runtime?.id) {
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      if (sender.id !== chrome.runtime.id) return;
+      if (message?.type === "SHARE_LINK_GUARD_GET_STATE") { sendResponse(getState()); return false; }
+      if (message?.type === "SHARE_LINK_GUARD_AUDIT_NOW") {
+        auditCurrentPage().then(report => sendResponse({ ok: true, report, state: getState() }))
+          .catch(error => sendResponse({ ok: false, error: String(error?.message || error) }));
+        return true;
+      }
+      return false;
+    });
+  }
   globalThis.ShareLinkGuardController = Object.freeze({
-    getState: () => ({ phase: state.phase, protected: state.protected, notice: state.notice,
-      transactionCount: state.counter, activeTransaction: state.transaction?.id || null }),
-    refreshStatus
+    getState, refreshStatus, dismissNotice, auditCurrentPage
   });
   refreshStatus();
 })();

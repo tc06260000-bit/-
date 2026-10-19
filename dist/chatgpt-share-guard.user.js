@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 分享原文核对（普通聊天）
 // @namespace    https://github.com/tc06260000-bit/-
-// @version      1.0.0
-// @description  发送分享链接前核对当前分享文字，补入原文；失败则停止本次发送。
+// @version      1.1.0
+// @description  分享原文自动补入、回复引用核对与历史链接检查；平时静默，有问题再提醒。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
 // @grant        none
@@ -388,6 +388,641 @@
   return Object.freeze({ ShareGuardError, normalizeShareUrl, findShareLinks, parseShareHtml, buildGroundedPrompt });
 });
 
+/* Share Link Guard local reply diagnostics — MIT.
+ * Pure string comparisons: no network, model/API calls, or execution of source data.
+ * These checks cannot establish the truth of every claim or prove a full reading.
+ */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  if (root) root.ShareLinkGuardDiagnostics = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  const MAX_REPLY_CHARS = 200000;
+  const MAX_SOURCE_CHARS = 12 * 1024 * 1024;
+  const MAX_MESSAGES = 25000;
+  const LIMITATION = '仅核对消息编号、明确条数和可匹配引文；未发现机械问题不代表没有事实错误或幻觉，也不能证明已读完全文。';
+  const ALNUM = /[\p{L}\p{N}]/u;
+  const substantialLength = text => (text.match(/[\p{L}\p{N}]/gu) || []).length;
+  const strongQuote = text => substantialLength(text) >= 8 &&
+    (/[\u3400-\u9fff]/.test(text) || normalize(text).split(/\s+/).filter(word => /[\p{L}\p{N}]/u.test(word)).length >= 2);
+  const excerpt = text => text.length > 180 ? text.slice(0, 177) + '…' : text;
+
+  function normalize(text) {
+    return text.normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g, '')
+      .replace(/\*\*([^*\n]+)\*\*/g, '$1').replace(/`([^`\n]+)`/g, '$1')
+      .replace(/\s+/g, ' ').trim();
+  }
+
+  function codeSpans(text) {
+    return Array.from(text.matchAll(/```[\s\S]*?(?:```|$)|`[^`\n]*`/g), match => ({ start: match.index, end: match.index + match[0].length }));
+  }
+
+  function inside(position, spans) {
+    let low = 0, high = spans.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (spans[middle].start <= position) low = middle + 1;
+      else high = middle;
+    }
+    return low > 0 && position < spans[low - 1].end;
+  }
+
+  function quoteSpans(text, code) {
+    const pairs = { '“': '”', '「': '」', '『': '』', '"': '"', "'": "'" };
+    const result = [];
+    for (let start = 0; start < text.length; start++) {
+      const opening = text[start], closing = pairs[opening];
+      if (!closing || inside(start, code)) continue;
+      if (opening === "'" && (start > 0 && ALNUM.test(text[start - 1]) || /\s/.test(text[start + 1] || ' '))) continue;
+      let end = start + 1;
+      for (; end < text.length && end - start <= 20000; end++) {
+        if (text[end] === '\\' && (opening === '"' || opening === "'")) { end++; continue; }
+        if (text[end] === closing) break;
+      }
+      if (end >= text.length || end - start > 20000) continue;
+      if (opening === "'" && ALNUM.test(text[end + 1] || '')) continue;
+      result.push({ start, end: end + 1, text: text.slice(start + 1, end) });
+      start = end;
+    }
+    return result;
+  }
+
+  function maskSpans(text, spans) {
+    if (!spans.length) return text;
+    const chars = text.split('');
+    for (const { start, end } of spans) {
+      for (let i = start; i < end; i++) if (chars[i] !== '\n') chars[i] = ' ';
+    }
+    return chars.join('');
+  }
+
+  function citations(text, quotes, code) {
+    const result = [];
+    for (const match of text.matchAll(/\[[^\]\r\n]{1,180}\]|【[^】\r\n]{1,180}】/g)) {
+      if (inside(match.index, quotes) || inside(match.index, code)) continue;
+      const ids = Array.from(match[0].matchAll(/\bT\d{1,8}\b/gi), item => item[0].toUpperCase());
+      if (ids.length) result.push({ start: match.index, end: match.index + match[0].length, ids });
+    }
+    return result;
+  }
+
+  function clusters(citations, text) {
+    const result = [];
+    for (const citation of citations) {
+      const previous = result[result.length - 1];
+      if (previous && citation.start - previous.end < 24 && /^[\s,，;；、&和及/]*$/.test(text.slice(previous.end, citation.start))) {
+        previous.end = citation.end;
+        previous.ids.push(...citation.ids);
+      } else result.push({ ...citation, ids: [...citation.ids] });
+    }
+    return result;
+  }
+
+  const QUOTE_CUE = /原文|原句|原话|引用|写道|写着|明确说|说的是|(?:\b(?:quote[ds]?|verbatim|says?|states?|reads?|wording|original\s+text)\b)/i;
+  const PARAPHRASE = /大意|意译|转述|改写|概括|换句话说|非逐字|并非原句|\b(?:paraphras\w*|roughly|summari[sz]\w*|approximately|in other words|not verbatim)\b/i;
+  function associatedIds(quote, groups, text) {
+    const nearby = [];
+    let low = 0, high = groups.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (groups[middle].end < quote.start - 100) low = middle + 1;
+      else high = middle;
+    }
+    for (let index = low; index < groups.length && groups[index].start <= quote.end + 100; index++) {
+      const group = groups[index];
+      let gap;
+      if (group.end <= quote.start && quote.start - group.end <= 100) gap = text.slice(group.end, quote.start);
+      else if (group.start >= quote.end && group.start - quote.end <= 100) gap = text.slice(quote.end, group.start);
+      else continue;
+      if (/^[\s:：,，;；.。!！?？—\-()（）]*$/.test(gap) || (!/[。！？!?\n]/.test(gap) && QUOTE_CUE.test(gap))) nearby.push(...group.ids);
+    }
+    return [...new Set(nearby)];
+  }
+
+  function quoteMatches(quote, normalizedSource) {
+    const normalized = normalize(quote);
+    if (!normalized) return false;
+    if (normalizedSource.includes(normalized)) return true;
+    // Explicit ellipses may omit source text. Check the remaining fragments in
+    // order within one cited message instead of demanding a contiguous match.
+    if (!/\.{3,}|…/.test(normalized)) return false;
+    const fragments = normalized.split(/\s*(?:\[(?:\.{3,}|…+)\]|\.{3,}|…+)\s*/).filter(Boolean);
+    if (!fragments.length || fragments.every(fragment => substantialLength(fragment) < 3)) return false;
+    let offset = 0;
+    for (const fragment of fragments) {
+      const found = normalizedSource.indexOf(fragment, offset);
+      if (found < 0) return false;
+      offset = found + fragment.length;
+    }
+    return true;
+  }
+
+  const CHINESE_DIGITS = { '零': 0, '〇': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+  const ENGLISH_NUMBERS = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+    ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20 };
+  function numberValue(token) {
+    if (/^\d+$/.test(token)) return Number(token);
+    if (Object.prototype.hasOwnProperty.call(ENGLISH_NUMBERS, token.toLowerCase())) return ENGLISH_NUMBERS[token.toLowerCase()];
+    let result = 0, section = 0, digit = 0;
+    for (const char of token) {
+      if (Object.prototype.hasOwnProperty.call(CHINESE_DIGITS, char)) digit = CHINESE_DIGITS[char];
+      else if (char === '万') { result += (section + digit || 1) * 10000; section = digit = 0; }
+      else { section += (digit || 1) * ({ '十': 10, '百': 100, '千': 1000 }[char] || 0); digit = 0; }
+    }
+    return result + section + digit;
+  }
+
+  function sentenceAt(text, start, end) {
+    let left = start, right = end;
+    while (left > Math.max(0, start - 250) && !/[。！？!?\n]/.test(text[left - 1])) left--;
+    while (right < Math.min(text.length, end + 250) && !/[。！？!?\n]/.test(text[right])) right++;
+    return text.slice(left, right);
+  }
+  const ATTRIBUTION = /原(?:文|聊天|对话|记录)(?:中|里|说|写|的助手)|历史(?:对话|消息|记录)(?:中|里|说)|之前(?:的)?(?:助手|回复|回答)(?:说|写|表示)|对方(?:说|写|表示)|\b(?:(?:original|previous|historical|quoted)\s+(?:assistant|message|reply)|(?:assistant|user)\s+(?:said|wrote|reported))\b/i;
+  const HYPOTHETICAL = /如果|假设|假如|若有|例如|比如|\b(?:for example|suppose|if there|hypothetical)\b/i;
+  function countClaims(masked) {
+    const result = [];
+    const chineseNumber = '(\\d{1,6}|[零〇一二两三四五六七八九十百千万]{1,8})';
+    const patterns = [
+      new RegExp('(?:共(?:有|计|收到|读取(?:了)?|读到(?:了)?)?|总共(?:有|收到|读取(?:了)?|读到(?:了)?)?|收到|读到(?:了)?|读取(?:了)?|读取到(?:了)?)\\s*[:：]?\\s*' + chineseNumber + '\\s*条\\s*(?:可见\\s*)?(?:消息|对话(?:消息)?|聊天记录|记录)', 'g'),
+      new RegExp('消息(?:总数|数量)(?:为|是|[:：])\\s*' + chineseNumber + '\\s*条?', 'g'),
+      /\b(?:I\s+(?:(?:have|already|successfully)\s+)*(?:received|read|loaded)|there\s+(?:are|were)|(?:a\s+)?total\s+of|(?:the\s+)?(?:chat|conversation|source|transcript)\s+(?:contains|has))\s*(?:a\s+total\s+of\s+|all\s+)?(\d{1,6}|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s+(?:visible\s+)?messages\b/gi
+    ];
+    for (const pattern of patterns) {
+      for (const match of masked.matchAll(pattern)) {
+        const sentence = sentenceAt(masked, match.index, match.index + match[0].length);
+        if (!ATTRIBUTION.test(sentence) && !HYPOTHETICAL.test(sentence)) result.push({ value: numberValue(match[1]), evidence: match[0], offset: match.index });
+      }
+    }
+    return result;
+  }
+
+  function readingClaims(masked) {
+    const failure = [], success = [];
+    const failurePatterns = [
+      /我(?:目前|现在|仍然|这边|暂时|还)?(?:无法|不能|没能|未能|没有|尚未|未)(?:直接|实际|完整|成功|全部)?(?:访问|打开|读取|读到|看到|获取|读过)[^。！？\n]{0,60}/g,
+      /我(?:目前|现在|仍然|暂时)?(?:打不开|读不到|看不到)[^。！？\n]{0,60}/g,
+      /(?:^|[。！？\n])\s*(?:(?:抱歉|很抱歉|目前|当前|现在|暂时)[，,:：\s]*)*(?:无法|不能|尚未|未能|没有)(?:直接|实际|完整|成功)?(?:访问|打开|读取|读到|看到|获取|读过)[^。！？\n]{0,60}/g,
+      /\bI\s+(?:(?:currently|still|actually)\s+)?(?:cannot|can't|can’t|am unable to|haven't|have not|did not|didn't)\s+(?:(?:directly|actually|fully)\s+)?(?:read|access|open|view|retrieve|see)\b[^.!?\n]{0,80}/gi,
+      /\bI\s+(?:don't|do not)\s+have\s+access\s+to\b[^.!?\n]{0,80}/gi,
+      /(?:^|[.!?\n])\s*(?:Sorry[,;:]?\s*)?(?:Unable to|Cannot)\s+(?:directly\s+)?(?:read|access|open|view)\b[^.!?\n]{0,80}/gi
+    ];
+    const successPatterns = [
+      /我(?:已经|已|刚刚|确实|现在)?(?:完整|全部|逐条|成功|通篇|认真)?(?:读取|读完|读过|看完|阅读)(?:了|过)?[^。！？\n]{0,40}(?:全文|原文|分享|聊天|对话|链接|记录|全部消息|所有消息)/g,
+      /我(?:已经|已|刚刚|确实)?(?:完整|全部|逐条|成功)?(?:读完|看完)(?:了)?(?=[，。！？\s]|$)/g,
+      /已(?:经)?(?:完整|全部|成功|逐条)?(?:读取|读完|阅读|看完)[^。！？\n]{0,30}(?:全文|原文|分享|聊天|对话|链接|记录)/g,
+      /\bI(?:'ve| have| have already| already| just)?\s+(?:(?:fully|completely|successfully|carefully|actually)\s+)?(?:read|reviewed|accessed|opened)\s+(?:(?:the|this|your|entire|full|whole|all)\s+)*(?:conversation|chat|shared?(?: link)?|transcript|source(?: text)?|record|provided text|full text|it all|everything)\b/gi
+    ];
+    for (const [patterns, target] of [[failurePatterns, failure], [successPatterns, success]]) {
+      for (const pattern of patterns) for (const match of masked.matchAll(pattern)) {
+        const sentence = sentenceAt(masked, match.index, match.index + match[0].length);
+        if (!ATTRIBUTION.test(sentence) && !HYPOTHETICAL.test(sentence)) target.push({ evidence: match[0], offset: match.index });
+      }
+    }
+    return { failure, success };
+  }
+
+  function analyzeReply(text, source) {
+    const findings = [], findingKeys = new Set();
+    let verifiedQuotes = 0, checkedCitations = 0, mechanicalIssue = false, needsReview = false;
+    function add(code, severity, message, evidence, extra, key) {
+      const identifier = key || code + ':' + (evidence || '');
+      if (findingKeys.has(identifier)) return;
+      findingKeys.add(identifier);
+      findings.push({ code, severity, message, ...(evidence ? { evidence: excerpt(evidence) } : {}), ...(extra || {}) });
+    }
+    function finish() {
+      const status = mechanicalIssue ? 'issues' : needsReview ? 'review' : 'no_mechanical_issue';
+      const summary = status === 'issues' ? '发现需要核对的编号、条数或引文问题。' : status === 'review' ? '阅读情况仍需人工核对，不能判定已读完。' : '未发现本地可检测的编号、条数或引文问题；不代表没有幻觉。';
+      add('LIMITATION', 'info', LIMITATION);
+      return { status, findings, verifiedQuotes, checkedCitations, summary };
+    }
+    if (typeof text !== 'string' || !text.trim()) {
+      needsReview = true;
+      add('EMPTY_REPLY', 'info', '回复为空，尚无可核对内容。');
+      return finish();
+    }
+    if (text.length > MAX_REPLY_CHARS) {
+      needsReview = true;
+      add('CHECK_LIMIT_EXCEEDED', 'warning', '回复超过本地检查预算，未作截断核对，请人工检查。');
+      return finish();
+    }
+    if (!source || !Array.isArray(source.messages) || !source.messages.length || source.messages.length > MAX_MESSAGES) {
+      needsReview = true;
+      add('SOURCE_UNAVAILABLE', 'warning', '没有有效的已提取来源，无法核对这条回复。');
+      return finish();
+    }
+    const messages = new Map();
+    let sourceChars = 0;
+    for (const message of source.messages) {
+      if (!message || typeof message.id !== 'string' || !/^T\d{4,8}$/.test(message.id) ||
+          typeof message.text !== 'string' || messages.has(message.id)) {
+        needsReview = true;
+        add('SOURCE_INVALID', 'warning', '来源的消息编号或文本不完整，无法可靠核对。');
+        return finish();
+      }
+      sourceChars += message.text.length;
+      if (sourceChars > MAX_SOURCE_CHARS) {
+        needsReview = true;
+        add('CHECK_LIMIT_EXCEEDED', 'warning', '来源超过本地检查预算，未作截断核对，请人工检查。');
+        return finish();
+      }
+      messages.set(message.id, { text: message.text, normalized: normalize(message.text) });
+    }
+    const code = codeSpans(text), quotes = quoteSpans(text, code);
+    const references = citations(text, quotes, code), groups = clusters(references, text);
+    for (const reference of references) for (const id of reference.ids) {
+      checkedCitations++;
+      if (!messages.has(id)) {
+        mechanicalIssue = true;
+        add('UNKNOWN_CITATION', 'error', '引用编号 [' + id + '] 不在已提取的来源中。', text.slice(reference.start, reference.end),
+          { citationId: id, offset: reference.start }, 'UNKNOWN_CITATION:' + id);
+      }
+    }
+    for (const quote of quotes) {
+      const ids = associatedIds(quote, groups, text).filter(id => messages.has(id));
+      if (!ids.length || substantialLength(quote.text) < 3) continue;
+      const surrounding = text.slice(Math.max(0, quote.start - 80), quote.start) + ' ' + text.slice(quote.end, Math.min(text.length, quote.end + 80));
+      if (PARAPHRASE.test(surrounding)) continue;
+      if (ids.some(id => quoteMatches(quote.text, messages.get(id).normalized))) verifiedQuotes++;
+      else if (strongQuote(quote.text)) {
+        mechanicalIssue = true;
+        add('QUOTE_NOT_MATCHED', 'warning', '紧邻引用编号的引文未在对应消息中匹配；可能有改写、排版或引用对应问题，不能据此认定事实造假。', quote.text,
+          { citationIds: ids, offset: quote.start });
+      }
+    }
+    const masked = maskSpans(text, [...code, ...quotes]);
+    for (const claim of countClaims(masked)) {
+      if (claim.value !== source.messages.length) {
+        mechanicalIssue = true;
+        add('MESSAGE_COUNT_MISMATCH', 'warning', '回复明确声明 ' + claim.value + ' 条消息，与当前提取来源的 ' + source.messages.length + ' 条不符；请核对其声明的范围。', claim.evidence,
+          { claimedCount: claim.value, expectedCount: source.messages.length, offset: claim.offset }, 'MESSAGE_COUNT_MISMATCH:' + claim.value);
+      }
+    }
+    const claims = readingClaims(masked);
+    if (claims.failure.length) {
+      needsReview = true;
+      add('READING_FAILURE_SELF_REPORT', 'warning', '回复自述无法访问或尚未读取原文，可能存在阅读失败；这是模型自述，仍需核对实际读取情况。', claims.failure[0].evidence);
+    }
+    if (claims.success.length && verifiedQuotes === 0) {
+      needsReview = true;
+      add('READING_CLAIM_UNVERIFIED', 'warning', '回复声称读过，但没有可匹配原句；仅有编号不足以验证，不能判定已读完。', claims.success[0].evidence);
+    }
+    return finish();
+  }
+
+  return Object.freeze({ analyzeReply });
+});
+
+/* Passive answer audit. No requests except the caller's canonical share fetcher;
+ * never sends messages, changes a conversation, or treats an unchecked source as false.
+ */
+(function (root, factory) {
+  const api = factory(root);
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  if (root) root.ShareLinkGuardAudit = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (root) {
+  'use strict';
+  const MESSAGE_SELECTOR = '[data-message-author-role="user"],[data-message-author-role="assistant"],[data-user-message-bubble],[data-chatgpt-selection-message-id]';
+  const UUID = '[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}';
+  let requiredCore = null;
+  try { if (typeof require === 'function') requiredCore = require('./core.js'); } catch (_) { /* browser */ }
+  const normalizeText = value => String(value || '').replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ').trim();
+
+  function canonicalUrl(value, core) {
+    if (core && typeof core.normalizeShareUrl === 'function') return core.normalizeShareUrl(value);
+    const match = typeof value === 'string' && value.match(new RegExp('^https://chatgpt\\.com/share/(' + UUID + ')/?$', 'i'));
+    if (!match) throw new Error('需要有效的公开 ChatGPT 分享地址。');
+    return 'https://chatgpt.com/share/' + match[1].toLowerCase();
+  }
+  function sharePageUrl(href, core) {
+    try {
+      const url = new URL(href);
+      return url.origin === 'https://chatgpt.com' && url.pathname.startsWith('/share/') ? canonicalUrl(href, core) : null;
+    } catch (_) { return null; }
+  }
+  function routeKey(href) {
+    try { const url = new URL(href); return url.origin + url.pathname; }
+    catch (_) { return String(href || ''); }
+  }
+  function canCarryContext(oldHref, newHref, requestText, messages) {
+    let oldUrl, newUrl;
+    try { oldUrl = new URL(oldHref); newUrl = new URL(newHref); } catch (_) { return false; }
+    return oldUrl.origin === 'https://chatgpt.com' && newUrl.origin === oldUrl.origin && oldUrl.pathname === '/' &&
+      /^\/c\/[^/]+\/?$/.test(newUrl.pathname) && Boolean(normalizeText(requestText)) &&
+      messages.some(message => message.role === 'user' && normalizeText(message.text) === normalizeText(requestText));
+  }
+
+  function findLatestLinkedPair(messages, core) {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const user = messages[index];
+      if (user.role !== 'user' || !/chatgpt\.com\/share\/|chat\.openai\.com\/share\//i.test(user.text || '')) continue;
+      let links;
+      try {
+        links = core.findShareLinks(user.text || '');
+        links = [...new Set(links.map(link => canonicalUrl(link.url, core)))];
+      } catch (_) { return { error: 'INVALID_SOURCE_LINK', userIndex: index }; }
+      if (links.length !== 1) return { error: links.length ? 'AMBIGUOUS_SOURCE_LINKS' : 'INVALID_SOURCE_LINK', userIndex: index };
+      let reply = null, replyIndex = -1;
+      for (let next = index + 1; next < messages.length && messages[next].role !== 'user'; next++) {
+        if (messages[next].role === 'assistant' && normalizeText(messages[next].text)) { reply = messages[next]; replyIndex = next; }
+      }
+      if (!reply) return { pending: true, sourceUrl: links[0], userIndex: index };
+      return { sourceUrl: links[0], userIndex: index, replyIndex, reply };
+    }
+    return null;
+  }
+
+  function visible(element, win) {
+    if (!element || element.isConnected === false) return false;
+    if (element.closest && element.closest('[hidden],[aria-hidden="true"]')) return false;
+    if (element.getClientRects && !element.getClientRects().length) return false;
+    if (win && win.getComputedStyle) {
+      const style = win.getComputedStyle(element);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+    }
+    return true;
+  }
+  function messageRole(element) {
+    const direct = element.getAttribute('data-message-author-role');
+    if (direct === 'user' || direct === 'assistant') return direct;
+    if (element.hasAttribute('data-user-message-bubble')) return 'user';
+    const unit = element.closest('[data-chatgpt-search-unit-key]');
+    const key = unit && unit.getAttribute('data-chatgpt-search-unit-key');
+    if (key && /:assistant$/.test(key)) return 'assistant';
+    if (key && /:user$/.test(key)) return 'user';
+    if (element.hasAttribute('data-chatgpt-selection-message-id')) {
+      const turn = element.closest('[data-turn-key]');
+      if (turn && turn.querySelector('h4[data-conversation-role="assistant"]')) return 'assistant';
+    }
+    return null;
+  }
+  function textFromTree(element) {
+    const blocks = new Set(['ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DIV', 'DL', 'DT', 'DD', 'FIGCAPTION', 'FIGURE',
+      'FOOTER', 'HEADER', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HR', 'LI', 'MAIN', 'OL', 'P', 'PRE', 'SECTION', 'TABLE', 'TR', 'UL']);
+    function walk(node) {
+      if (node.nodeType === 3) return node.nodeValue || '';
+      const tag = String(node.tagName || '').toUpperCase();
+      const attribute = name => node.getAttribute ? node.getAttribute(name) : null;
+      if (['BUTTON', 'NAV', 'SCRIPT', 'STYLE', 'TEMPLATE'].includes(tag) || attribute('role') === 'button' ||
+          (tag === 'H4' && attribute('data-conversation-role') !== null) || attribute('aria-hidden') === 'true' || node.hidden) return '';
+      if (tag === 'BR') return '\n';
+      let text = '';
+      for (const child of node.childNodes || []) {
+        const part = walk(child);
+        if (!part) continue;
+        const block = blocks.has(String(child.tagName || '').toUpperCase());
+        if (block && text && !text.endsWith('\n')) text += '\n';
+        text += part;
+        if (block && !text.endsWith('\n')) text += '\n';
+      }
+      return text;
+    }
+    return walk(element).replace(/^\n+|\n+$/g, '');
+  }
+  function messageText(element) {
+    // Skip controls by DOM identity, never by deleting a same-named line from
+    // live text: an answer can legitimately contain the word “Copy/复制”.
+    if (!element.querySelector('h4[data-conversation-role],button,[role="button"],nav')) return element.innerText || element.textContent || '';
+    return textFromTree(element);
+  }
+  function domMessages(doc, win) {
+    if (!doc || !doc.querySelectorAll) return [];
+    const candidates = [...doc.querySelectorAll(MESSAGE_SELECTOR)].filter(element => visible(element, win))
+      .map(element => ({ element, role: messageRole(element) })).filter(item => item.role);
+    return candidates.filter(item => !candidates.some(other => other !== item && other.role === item.role && item.element.contains(other.element)))
+      .map(item => ({ ...item, text: messageText(item.element), key: item.element.getAttribute('data-message-id') ||
+        item.element.getAttribute('data-chatgpt-selection-message-id') || item.element.closest('[data-turn-key]')?.getAttribute('data-turn-key') || '' }));
+  }
+  function generating(doc, win, target) {
+    const turn = target?.element?.closest('[data-talvt-turn-state]');
+    const state = turn && turn.getAttribute('data-talvt-turn-state');
+    if (state && state !== 'complete') return true;
+    if (!doc || !doc.querySelectorAll) return false;
+    return [...doc.querySelectorAll('button,[data-is-streaming="true"],[data-streaming="true"],[aria-busy="true"]')].some(element => {
+      if (!visible(element, win)) return false;
+      if (element.getAttribute('data-testid') === 'stop-button') return true;
+      if (element.getAttribute('data-is-streaming') === 'true' || element.getAttribute('data-streaming') === 'true' || element.getAttribute('aria-busy') === 'true') return true;
+      const label = (element.getAttribute('aria-label') || '').trim();
+      return /^(?:stop|停止|中止)$/i.test(label) || /stop generating|stop streaming|停止生成|停止回答|停止响应|中止回答/i.test(label);
+    });
+  }
+
+  function create(options) {
+    const opts = options || {};
+    if (typeof opts.fetchShare !== 'function') throw new TypeError('fetchShare is required');
+    const win = opts.window || root.window || root;
+    const doc = opts.document || win.document || root.document;
+    const location = opts.location || win.location || root.location || { href: '' };
+    const core = opts.core || root.ShareLinkGuardCore || requiredCore;
+    if (!core || typeof core.findShareLinks !== 'function') throw new TypeError('ShareLinkGuardCore is required');
+    const diagnostics = () => opts.diagnostics || root.ShareLinkGuardDiagnostics;
+    const onResult = typeof opts.onResult === 'function' ? opts.onResult : () => {};
+    const quietMs = Number.isFinite(opts.quietMs) ? Math.max(0, opts.quietMs) : 1200;
+    const schedule = opts.setTimeout || root.setTimeout.bind(root);
+    const unschedule = opts.clearTimeout || root.clearTimeout.bind(root);
+    const every = opts.setInterval || root.setInterval.bind(root);
+    const stopEvery = opts.clearInterval || root.clearInterval.bind(root);
+    let started = false, disposed = false, context = null, report = null, phase = 'idle';
+    let epoch = 0, task = 0, observedRoute = routeKey(location.href), timer = null, interval = null, observer = null;
+    let pending = null, lastAudited = null, automaticShareRoute = null, manualTask = null;
+
+    function stopPending() { if (timer !== null) unschedule(timer); timer = null; pending = null; }
+    function snapshot() { return domMessages(doc, win); }
+    function current(job) { return !disposed && job.epoch === epoch && job.task === task && job.route === routeKey(location.href); }
+    function newJob(manual) { return { epoch, task: ++task, route: routeKey(location.href), manual: Boolean(manual) }; }
+    function targetInfo(type, message, index) { return { type, pageUrl: routeKey(location.href), messageId: message?.key || message?.id || '', index,
+      scope: type === 'share_reply' ? 'current_public_share_visible_text_reply' : 'current_page_visible_reply_only',
+      completionEvidence: type === 'share_reply' ? 'fixed_public_snapshot' : 'visible_dom_signals_and_quiet_heuristic_only' }; }
+    function output(status, summary, sourceUrl, target, manual, findings) {
+      return { status, findings: findings || [], sourceUrl: sourceUrl || null, target: target || null, summary, manual: Boolean(manual) };
+    }
+    function publish(job, value) {
+      if (!current(job)) return null;
+      report = value;
+      phase = 'idle';
+      if (manualTask === job.task) manualTask = null;
+      if (value.status !== 'not_applicable' || value.manual) {
+        try { onResult(value); } catch (_) { /* UI callbacks must not restart or break audits. */ }
+      }
+      return value;
+    }
+    function unverified(job, code, summary, sourceUrl, target) {
+      return publish(job, output('unverified', summary, sourceUrl, target, job.manual,
+        [{ code, severity: 'info', message: summary }]));
+    }
+    function checkRoute() {
+      const next = routeKey(location.href);
+      if (next === observedRoute) return;
+      const carry = context && canCarryContext(observedRoute, next, context.requestText, snapshot());
+      stopPending(); epoch++; task++; manualTask = null; report = null; phase = 'idle'; lastAudited = null;
+      if (!carry) context = null;
+      observedRoute = next;
+      automaticShareRoute = null;
+    }
+    function contextReply(messages) {
+      if (!context) return null;
+      let userIndex = -1;
+      if (context.requestText) {
+        userIndex = messages.findIndex(message => message.role === 'user' && !context.userBaseline.has(message.element) &&
+          normalizeText(message.text) === context.requestText);
+        if (userIndex < 0 && context.boundUser) userIndex = messages.findIndex(message => message.element === context.boundUser);
+        if (userIndex < 0) return null;
+        context.boundUser = messages[userIndex].element;
+      }
+      let reply = null, replyIndex = -1;
+      for (let index = userIndex + 1; index < messages.length; index++) {
+        const message = messages[index];
+        if (message.role === 'user') {
+          // Never apply this source to a later independent user turn.
+          if (userIndex >= 0) break;
+          continue;
+        }
+        if (message.role === 'assistant' && !context.assistantBaseline.has(message.element) && normalizeText(message.text)) {
+          reply = message; replyIndex = index;
+        }
+      }
+      return reply ? { reply, replyIndex } : null;
+    }
+    function analyze(job, reply, source, target) {
+      if (!current(job)) return null;
+      const engine = diagnostics();
+      if (!engine || typeof engine.analyzeReply !== 'function') return unverified(job, 'DIAGNOSTICS_UNAVAILABLE', '检查模块尚未就绪，暂时无法核对。', source.url, target);
+      try {
+        const result = engine.analyzeReply(reply.text, source);
+        if (!result || !['issues', 'review', 'no_mechanical_issue'].includes(result.status)) throw new Error('Unknown diagnostic result');
+        return publish(job, output(result.status, result.summary, source.url, target, job.manual, result.findings || []));
+      } catch (_) { return unverified(job, 'DIAGNOSTICS_FAILED', '机械核对未能完成，不能据此判断回答是否编造。', source.url, target); }
+    }
+    async function fetchChecked(url) {
+      const canonical = canonicalUrl(url, core);
+      const source = await opts.fetchShare(canonical);
+      if (!source || !Array.isArray(source.messages) || !source.messages.length || canonicalUrl(source.url, core) !== canonical) throw new Error('来源结构或分享地址不一致');
+      return source;
+    }
+
+    async function auditCurrentPage(settings) {
+      const manual = !settings || settings.manual !== false;
+      if (disposed) return null;
+      checkRoute(); stopPending();
+      const job = newJob(manual);
+      if (manual) manualTask = job.task;
+      phase = 'checking';
+      const pageShare = sharePageUrl(location.href, core);
+      if (pageShare) automaticShareRoute = job.route;
+      let sourceUrl = null, target = null;
+      try {
+        if (pageShare) {
+          const page = await fetchChecked(pageShare);
+          if (!current(job)) return null;
+          const pair = findLatestLinkedPair(page.messages, core);
+          if (!pair) return publish(job, output('not_applicable', '当前分享快照中没有“用户给出分享链接后助手回答”的可核对配对。', null, null, manual));
+          if (pair.error) return unverified(job, pair.error, '最近一条相关消息的分享来源无效或不唯一，不能选择原文。', null, null);
+          if (pair.pending) return publish(job, output('not_applicable', '最近的分享链接后尚无可核对的助手回答。', pair.sourceUrl, null, manual));
+          sourceUrl = pair.sourceUrl;
+          target = targetInfo('share_reply', pair.reply, pair.replyIndex);
+          if (sourceUrl === pageShare) return unverified(job, 'SELF_REFERENCE', '分享记录引用了它自己，不能用自引用验证回答。', sourceUrl, target);
+          const source = await fetchChecked(sourceUrl);
+          if (!current(job)) return null;
+          return analyze(job, pair.reply, source, target);
+        }
+        const messages = snapshot();
+        const live = context && contextReply(messages);
+        if (context) {
+          if (!live) return publish(job, output('not_applicable', '本次来源之后尚无新的可核对助手回复。', context.share.url, null, manual));
+          target = targetInfo('live_reply', live.reply, live.replyIndex);
+          if (generating(doc, win, live.reply)) return unverified(job, 'REPLY_IN_PROGRESS', '回答仍在生成，请完成后再检查。', context.share.url, target);
+          return analyze(job, live.reply, context.share, target);
+        }
+        const pair = findLatestLinkedPair(messages, core);
+        if (!pair) return publish(job, output('not_applicable', '当前可见聊天中没有找到分享链接及其后的助手回复；未读取虚拟列表之外的历史。', null, null, manual));
+        if (pair.error) return unverified(job, pair.error, '最近一条相关消息的分享来源无效或不唯一，无法核对。', null, null);
+        if (pair.pending) return publish(job, output('not_applicable', '最近的分享链接后尚无可核对的助手回复。', pair.sourceUrl, null, manual));
+        sourceUrl = pair.sourceUrl; target = targetInfo('visible_chat', pair.reply, pair.replyIndex);
+        if (generating(doc, win, pair.reply)) return unverified(job, 'REPLY_IN_PROGRESS', '回答仍在生成，请完成后再检查。', sourceUrl, target);
+        const originalText = pair.reply.text;
+        const source = await fetchChecked(sourceUrl);
+        if (!current(job)) return null;
+        const now = snapshot();
+        const present = now.find(message => message.element === pair.reply.element && message.role === 'assistant');
+        if (!present || present.text !== originalText || generating(doc, win, present)) return unverified(job, 'REPLY_CHANGED', '读取原文期间回答发生变化，本次未判断；请待回复完成后重试。', sourceUrl, target);
+        return analyze(job, present, source, target);
+      } catch (error) {
+        return unverified(job, 'SOURCE_UNVERIFIED', '未能读取可核验的分享原文，不能判断回答是否编造。' + (error?.message ? ' ' + String(error.message).slice(0, 240) : ''), sourceUrl || pageShare, target);
+      }
+    }
+
+    function tick() {
+      if (disposed) return;
+      checkRoute();
+      const pageShare = sharePageUrl(location.href, core);
+      if (pageShare && !context && automaticShareRoute !== observedRoute && manualTask === null) {
+        automaticShareRoute = observedRoute;
+        timer = schedule(() => { timer = null; void auditCurrentPage({ manual: false }); }, quietMs);
+        return;
+      }
+      if (!context || manualTask !== null) return;
+      const item = contextReply(snapshot());
+      if (!item || generating(doc, win, item.reply)) { stopPending(); return; }
+      if (lastAudited && lastAudited.element === item.reply.element && lastAudited.text === item.reply.text) return;
+      if (pending && pending.element === item.reply.element && pending.text === item.reply.text) return;
+      stopPending();
+      const capturedEpoch = epoch, capturedContext = context;
+      pending = { element: item.reply.element, text: item.reply.text };
+      timer = schedule(() => {
+        const expected = pending; timer = null; pending = null;
+        if (!expected || disposed || epoch !== capturedEpoch || context !== capturedContext) return;
+        const latest = contextReply(snapshot());
+        if (!latest || latest.reply.element !== expected.element || latest.reply.text !== expected.text || generating(doc, win, latest.reply)) { tick(); return; }
+        const job = newJob(false);
+        lastAudited = expected;
+        analyze(job, latest.reply, context.share, targetInfo('live_reply', latest.reply, latest.replyIndex));
+      }, quietMs);
+    }
+    function setContext(share, settings) {
+      if (disposed) return false;
+      const url = canonicalUrl(share && share.url, core);
+      if (!share || !Array.isArray(share.messages) || !share.messages.length) throw new TypeError('Verified source messages are required');
+      checkRoute(); stopPending(); epoch++; task++; manualTask = null; report = null; phase = 'waiting'; lastAudited = null;
+      const messages = snapshot();
+      context = { share: { ...share, url }, requestText: normalizeText(settings && settings.requestText),
+        userBaseline: new Set(messages.filter(message => message.role === 'user').map(message => message.element)),
+        assistantBaseline: new Set(messages.filter(message => message.role === 'assistant').map(message => message.element)), boundUser: null };
+      if (started) tick();
+      return true;
+    }
+    function start() {
+      if (disposed || started) return api;
+      started = true;
+      const Observer = opts.MutationObserver || win.MutationObserver || root.MutationObserver;
+      if (Observer && doc) {
+        observer = new Observer(tick);
+        observer.observe(doc, { childList: true, characterData: true, subtree: true, attributes: true,
+          attributeFilter: ['data-talvt-turn-state', 'data-is-streaming', 'data-streaming', 'aria-busy', 'hidden', 'aria-hidden', 'style', 'class'] });
+      }
+      interval = every(tick, 400);
+      tick();
+      return api;
+    }
+    function dispose() {
+      if (disposed) return;
+      disposed = true; epoch++; task++; stopPending();
+      if (interval !== null) stopEvery(interval);
+      if (observer) observer.disconnect();
+      context = null; manualTask = null; phase = 'disposed';
+    }
+    const api = { start, setContext, auditCurrentPage, getState: () => {
+      if (!disposed) checkRoute();
+      return { phase, contextActive: Boolean(context), sourceUrl: context?.share.url || report?.sourceUrl || null, report };
+    }, dispose };
+    return Object.freeze(api);
+  }
+
+  return Object.freeze({ create, _test: Object.freeze({ normalizeText, canonicalUrl, sharePageUrl, routeKey, canCarryContext, findLatestLinkedPair, textFromTree }) });
+});
+
 /* Browser-only integration. No servers, keys, telemetry, or persistent storage. */
 (function () {
   "use strict";
@@ -403,27 +1038,40 @@
     '[data-testid="prompt-textarea"]',
     'form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]',
     'form[data-type="unified-composer"] [contenteditable="true"][role="textbox"]',
-    '[data-lexical-editor="true"][contenteditable="true"][role="textbox"]'
+    '[data-lexical-editor="true"][contenteditable="true"][role="textbox"]',
+    '[data-composer-markdown][contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"]',
+    '[contenteditable="plaintext-only"][role="textbox"]',
+    'textarea[aria-label="Message ChatGPT"]',
+    'textarea[aria-label="与 ChatGPT 聊天"]',
+    'textarea[placeholder="有问题，尽管问"]'
   ].join(",");
   const SEND_LABELS = new Set(["发送", "发送消息", "发送提示", "send", "send message", "send prompt"]);
   const state = {
     phase: "idle", revision: 0, writing: false, transaction: null,
     replayWindow: null, prepared: null, lastExport: null, notice: "",
-    protected: false, counter: 0
+    protected: false, counter: 0, noticeUntil: 0, noticeToken: 0, lastAudit: null
   };
   let statusElement;
   let statusText;
   let downloadButton;
+  let noticeTimer;
+  let audit = null;
   let refreshing = false;
 
   function visible(element) {
-    return Boolean(element && element.isConnected && element.getClientRects().length &&
+    return Boolean(element && element.isConnected && !element.closest('[hidden], [inert], [aria-hidden="true"]') && element.getClientRects().length &&
       getComputedStyle(element).visibility !== "hidden" && getComputedStyle(element).display !== "none");
   }
 
+  function editorCandidate(element) {
+    return visible(element) && (element instanceof HTMLTextAreaElement || element.isContentEditable) &&
+      !element.disabled && !element.readOnly &&
+      !element.closest('[data-message-author-role], [data-user-message-bubble], [data-chatgpt-selection-message-id], [data-testid^="conversation-turn"], [data-chatgpt-search-unit-key]');
+  }
+
   function composer() {
-    const matches = [...document.querySelectorAll(EDITOR_SELECTOR)].filter(element =>
-      visible(element) && (element instanceof HTMLTextAreaElement || element.isContentEditable));
+    const matches = [...document.querySelectorAll(EDITOR_SELECTOR)].filter(editorCandidate);
     return matches.length === 1 ? matches[0] : null;
   }
 
@@ -437,7 +1085,17 @@
   }
 
   function scopeOf(editor) {
-    return editor?.closest('form, [data-chatgpt-composer], [data-type="unified-composer"]') || null;
+    if (!editor) return null;
+    const known = editor.closest('form, [data-chatgpt-composer], [data-type="unified-composer"], [data-testid="composer"]');
+    if (known && known !== editor) return known;
+    let parent = editor.parentElement;
+    for (let level = 0; parent && level < 8 && parent !== document.body; level++, parent = parent.parentElement) {
+      const buttons = [...parent.querySelectorAll("button")].filter(button => visible(button) && isSendButton(button));
+      if (!buttons.length) continue;
+      const editors = [...parent.querySelectorAll(EDITOR_SELECTOR)].filter(editorCandidate);
+      return buttons.length === 1 && editors.length === 1 && editors[0] === editor ? parent : null;
+    }
+    return null;
   }
 
   function isSendButton(button) {
@@ -472,7 +1130,8 @@
     statusElement.id = "share-link-guard-status";
     statusElement.setAttribute("role", "status");
     statusElement.setAttribute("aria-live", "polite");
-    statusElement.style.cssText = "position:fixed;left:12px;bottom:12px;max-width:min(500px,85vw);z-index:2147483647;padding:9px 12px;border:1px solid #64748b;border-radius:10px;background:#0f172a;color:#f8fafc;font:12px/1.5 system-ui,sans-serif;box-shadow:0 2px 12px #0003;white-space:normal;";
+    statusElement.hidden = true;
+    statusElement.style.cssText = "display:none;position:fixed;right:16px;top:72px;max-width:min(440px,85vw);z-index:2147483647;padding:12px 38px 12px 14px;border:1px solid #64748b;border-radius:10px;background:#0f172a;color:#f8fafc;font:13px/1.6 system-ui,sans-serif;box-shadow:0 2px 12px #0003;white-space:normal;";
     statusText = document.createElement("span");
     downloadButton = document.createElement("button");
     downloadButton.type = "button";
@@ -480,6 +1139,7 @@
     downloadButton.hidden = true;
     downloadButton.style.cssText = "display:block;margin-top:5px;border:1px solid #94a3b8;border-radius:5px;padding:3px 7px;background:#1e293b;color:#f8fafc;cursor:pointer;";
     downloadButton.addEventListener("click", () => {
+      checkPage();
       if (!state.lastExport) return;
       const blob = new Blob([state.lastExport], { type: "text/plain;charset=utf-8" });
       const url = URL.createObjectURL(blob);
@@ -491,7 +1151,13 @@
       anchor.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
-    statusElement.append(statusText, downloadButton);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "×";
+    close.setAttribute("aria-label", "关闭提示");
+    close.style.cssText = "position:absolute;top:5px;right:7px;border:0;background:transparent;color:inherit;cursor:pointer;font:20px system-ui;";
+    close.addEventListener("click", dismissNotice);
+    statusElement.append(statusText, downloadButton, close);
     document.body.appendChild(statusElement);
   }
 
@@ -502,11 +1168,14 @@
       mountStatus();
       const editor = composer();
       state.protected = Boolean(editor && sendButton(editor));
-      const readiness = state.protected ? "分享原文核对：已就绪（仅文字分享链接）" :
-        "分享原文核对：未保护，未识别输入框或发送按钮";
-      const message = state.protected ? (state.notice || readiness) :
-        readiness + (state.notice ? "。最近状态：" + state.notice : "");
-      if (statusText && statusText.textContent !== message) statusText.textContent = message;
+      // Missing a composer is normal on a share/read-only page. Readiness is
+      // available in the toolbar popup; idle pages never get a permanent toast.
+      const show = Boolean(state.notice && (state.noticeUntil === Infinity || Date.now() < state.noticeUntil));
+      if (statusText && statusText.textContent !== state.notice) statusText.textContent = state.notice;
+      if (statusElement) {
+        statusElement.hidden = !show;
+        statusElement.style.display = show ? "block" : "none";
+      }
       if (downloadButton) {
         downloadButton.hidden = !state.lastExport;
         downloadButton.style.display = state.lastExport ? "block" : "none";
@@ -514,8 +1183,26 @@
     } finally { refreshing = false; }
   }
 
-  function notice(message) {
+  function dismissNotice() {
+    clearTimeout(noticeTimer);
+    state.notice = "";
+    state.noticeUntil = 0;
+    state.noticeToken++;
+    refreshStatus();
+  }
+
+  function notice(message, options = {}) {
+    clearTimeout(noticeTimer);
     state.notice = message;
+    const duration = options.persistent ? Infinity : (options.duration ?? 8000);
+    state.noticeUntil = duration === Infinity ? Infinity : Date.now() + duration;
+    const token = ++state.noticeToken;
+    if (duration !== Infinity) noticeTimer = setTimeout(() => {
+      if (state.noticeToken !== token) return;
+      state.notice = "";
+      state.noticeUntil = 0;
+      refreshStatus();
+    }, duration);
     refreshStatus();
   }
 
@@ -587,6 +1274,16 @@
     return Core.parseShareHtml(await readResponse(response, transaction.controller), { url });
   }
 
+  async function fetchForAudit(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try { return await getShare(Core.normalizeShareUrl(url), { controller }); }
+    catch (error) {
+      throw new Error(String(error?.message || error).replace(/[，,]?\s*未发送[。.]?/g, ""));
+    }
+    finally { clearTimeout(timer); }
+  }
+
   function writeComposer(editor, text) {
     editor.focus();
     if (editor instanceof HTMLTextAreaElement) {
@@ -621,6 +1318,10 @@
     if (!button) throw new Error("原文已填入，但发送按钮未就绪；未自动发送，也不会自动重试。");
     state.prepared = { text: prompt, editor: transaction.editor, href: location.href };
     state.phase = "replaying";
+    if (audit && transaction.share) {
+      audit.setContext(transaction.share, { requestText: prompt });
+      state.lastAudit = null;
+    }
     state.replayWindow = { button, editor: transaction.editor, text: prompt, href: location.href };
     notice(`已核对本次分享的 ${messageCount} 条文字，正在提交原文。`);
     try {
@@ -647,6 +1348,7 @@
       clearTimeout(timeout);
       if (invalidated(transaction)) return;
       const prompt = Core.buildGroundedPrompt(share, { question, maxChars: MAX_PROMPT_CHARS });
+      transaction.share = share;
       state.lastExport = prompt;
       if (invalidated(transaction)) return;
       state.phase = "preparing";
@@ -707,7 +1409,7 @@
     state.phase = "loading";
     state.prepared = null;
     state.lastExport = null;
-    notice("正在读取并核对分享原文；完成前不会发送链接。");
+    notice("正在读取并核对分享原文；完成前不会发送链接。", { persistent: true });
     // Keep the user's actual request separate from the source conversation.
     const question = text.replace(links[0].raw, "").trim();
     void run(transaction, links[0].url, question);
@@ -747,6 +1449,10 @@
       observedHref = location.href;
       if (state.transaction) cancel();
       state.prepared = null;
+      state.lastExport = null;
+      state.lastAudit = null;
+      state.phase = "idle";
+      if (!state.transaction) dismissNotice();
     }
     if (state.transaction && !state.writing) {
       if (!state.transaction.editor.isConnected || composer() !== state.transaction.editor ||
@@ -758,10 +1464,68 @@
   observer.observe(document, { childList: true, subtree: true });
   setInterval(checkPage, 250);
   document.addEventListener("DOMContentLoaded", refreshStatus, { once: true });
+  function handleAuditResult(report) {
+    if (!report) return;
+    state.lastAudit = report;
+    const needsAttention = ["issues", "review", "unverified"].includes(report.status);
+    if (needsAttention || report.manual) {
+      const summary = report.summary || (report.status === "no_mechanical_issue" ?
+        "当前可核对项未发现不一致；这不能证明回答没有幻觉。" : "本次信息不足，尚不能核实这条回复。");
+      notice("回复核对：" + summary, { duration: needsAttention ? 12000 : 8000 });
+    }
+  }
+  if (globalThis.ShareLinkGuardAudit?.create) {
+    audit = globalThis.ShareLinkGuardAudit.create({ fetchShare: fetchForAudit, onResult: handleAuditResult });
+    audit.start();
+  }
+  async function auditCurrentPage() {
+    checkPage();
+    if (!audit) {
+      const report = { status: "unverified", manual: true, findings: [], summary: "回复核对模块尚未加载，请更新扩展并刷新网页。" };
+      handleAuditResult(report);
+      return report;
+    }
+    notice("正在核对当前对话最近一次分享链接的回复…", { persistent: true });
+    const token = state.noticeToken;
+    try {
+      const report = await audit.auditCurrentPage({ manual: true });
+      if (!report && state.noticeToken === token) dismissNotice();
+      return report;
+    } catch (error) {
+      const report = { status: "unverified", manual: true, findings: [], summary: "暂时无法核对：" + String(error?.message || error) };
+      if (state.noticeToken === token) handleAuditResult(report);
+      return report;
+    }
+  }
+  function getState() {
+    checkPage();
+    const auditState = audit?.getState() || null;
+    return { phase: state.phase, protected: state.protected, notice: state.notice,
+      noticeVisible: Boolean(state.notice && (state.noticeUntil === Infinity || Date.now() < state.noticeUntil)),
+      pageType: /^\/share\//.test(location.pathname) ? "share" : "chat",
+      transactionCount: state.counter, activeTransaction: state.transaction?.id || null,
+      audit: auditState, lastAudit: state.lastAudit || auditState?.report || null };
+  }
+  document.addEventListener("keydown", event => {
+    if (event.altKey && event.shiftKey && event.code === "KeyL") {
+      event.preventDefault();
+      void auditCurrentPage();
+    }
+  }, true);
+  if (typeof chrome !== "undefined" && chrome.runtime?.id) {
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      if (sender.id !== chrome.runtime.id) return;
+      if (message?.type === "SHARE_LINK_GUARD_GET_STATE") { sendResponse(getState()); return false; }
+      if (message?.type === "SHARE_LINK_GUARD_AUDIT_NOW") {
+        auditCurrentPage().then(report => sendResponse({ ok: true, report, state: getState() }))
+          .catch(error => sendResponse({ ok: false, error: String(error?.message || error) }));
+        return true;
+      }
+      return false;
+    });
+  }
   globalThis.ShareLinkGuardController = Object.freeze({
-    getState: () => ({ phase: state.phase, protected: state.protected, notice: state.notice,
-      transactionCount: state.counter, activeTransaction: state.transaction?.id || null }),
-    refreshStatus
+    getState, refreshStatus, dismissNotice, auditCurrentPage
   });
   refreshStatus();
 })();
